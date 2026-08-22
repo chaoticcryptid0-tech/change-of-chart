@@ -1208,16 +1208,25 @@ function computeChart(year, month, day, hourLocal, utcOffsetHours, lat, lon, pla
     const ic = norm180(mc + 180);
 
     const acPts = [], dcPts = [];
+    const acCoarse = [], dcCoarse = [];
+    let ptIdx = 0;
     for(let latI=-660; latI<=660; latI+=5){
       const la = latI/10;
       const val = -tan(la)*tan(dec);
       if(val < -1 || val > 1) continue;
       const H = acosd(val);
       const lstAC = ra - H, lstDC = ra + H;
-      acPts.push([la, norm180(lstAC - gst)]);
-      dcPts.push([la, norm180(lstDC - gst)]);
+      const acPt = [la, norm180(lstAC - gst)];
+      const dcPt = [la, norm180(lstDC - gst)];
+      acPts.push(acPt);
+      dcPts.push(dcPt);
+      // a sparser copy purely for "nearest city" searches over the whole city
+      // list -- the dense version stays for smooth map rendering, but scanning
+      // it against 30,000+ cities was the actual multi-second freeze
+      if(ptIdx % 10 === 0){ acCoarse.push(acPt); dcCoarse.push(dcPt); }
+      ptIdx++;
     }
-    planets[name] = { ra, dec, MC:mc, IC:ic, AC_segments: splitSegments(acPts), DC_segments: splitSegments(dcPts) };
+    planets[name] = { ra, dec, MC:mc, IC:ic, AC_segments: splitSegments(acPts), DC_segments: splitSegments(dcPts), AC_coarse: acCoarse, DC_coarse: dcCoarse };
   });
 
   const eps = obliquity(d);
@@ -1265,12 +1274,19 @@ function nearestCitiesToLine(astro, planet, angle, topN){
     const lineLon = pdata[angle];
     dists = CITIES.map(([name,clat,clon])=>({city:name, km:haversine(clat,clon,clat,lineLon)}));
   } else {
+    const pts = pdata[angle+'_coarse'];
+    // cheap bounding-box pre-check (plain arithmetic) before any haversine calls --
+    // this is what made every chart generation take 5-10+ seconds
+    let minLon=180, maxLon=-180;
+    pts.forEach(([,lo])=>{ if(lo<minLon) minLon=lo; if(lo>maxLon) maxLon=lo; });
+    const pad = 10; // degrees of slack so we never wrongly exclude a real near-miss
     dists = CITIES.map(([name,clat,clon])=>{
+      if(clon < minLon-pad || clon > maxLon+pad) return {city:name, km:20000};
       let mind = Infinity;
-      pdata[angle+'_segments'].forEach(seg=>seg.forEach(([plat,plon])=>{
+      pts.forEach(([plat,plon])=>{
         const dd = haversine(clat,clon,plat,plon);
         if(dd<mind) mind=dd;
-      }));
+      });
       return {city:name, km:mind};
     });
   }
@@ -1914,16 +1930,23 @@ function generateFromForm(){
   document.getElementById('formPanel').classList.remove('open');
   return true;
 }
-function findStandoutLine(){
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+async function findStandoutLine(){
   let best = null;
-  Object.keys(ASTRO.planets).forEach(planet=>{
-    ['AC','DC','MC','IC'].forEach(angle=>{
+  const planetNames = Object.keys(ASTRO.planets);
+  for(let i=0; i<planetNames.length; i++){
+    const planet = planetNames[i];
+    for(const angle of ['AC','DC','MC','IC']){
       const cities = nearestCitiesToLine(ASTRO, planet, angle, 1);
       if(cities[0] && (!best || cities[0].km < best.km)){
         best = {planet, angle, city: cities[0].city, km: cities[0].km};
       }
-    });
-  });
+    }
+    // yield back to the browser after each planet -- guarantees the tab never
+    // goes long enough without responding to trigger a "page unresponsive" freeze,
+    // regardless of how slow the device is
+    await sleep(0);
+  }
   return best;
 }
 function computeLocalHighlight(planet){
@@ -1931,7 +1954,7 @@ function computeLocalHighlight(planet){
   const result = localSpaceAzimuth(pd.ra, pd.dec, ASTRO.birth.lat, ASTRO.birth.lon, ASTRO.gst);
   return { azimuth: result.azimuth, compass: compassLabel(result.azimuth) };
 }
-function showSimpleResult(){
+async function showSimpleResult(){
   document.getElementById('welcomePanel').style.display = 'none';
   document.getElementById('mainApp').style.display = 'none';
   const b = ASTRO.basics;
@@ -1939,7 +1962,9 @@ function showSimpleResult(){
     <div class="sb-item"><span class="sb-glyph">☉</span><div class="sb-label">Sun</div><div class="sb-value">${b.sun.sign}</div></div>
     <div class="sb-item"><span class="sb-glyph">☽</span><div class="sb-label">Moon</div><div class="sb-value">${b.moon.sign}</div></div>
     <div class="sb-item"><span class="sb-glyph">↑</span><div class="sb-label">Rising</div><div class="sb-value">${b.ascendant.sign}</div></div>`;
-  const standout = findStandoutLine();
+  document.getElementById('simpleStandout').innerHTML = `<p class="empty-state">Finding your standout line…</p>`;
+  document.getElementById('simpleResultPanel').style.display = 'block';
+  const standout = await findStandoutLine();
   const meta = PLANET_META[standout.planet];
   const text = firstSentence((INTERP[standout.planet]||{})[standout.angle]);
   const local = computeLocalHighlight(standout.planet);
@@ -1952,10 +1977,9 @@ function showSimpleResult(){
       <div class="ss-local-title">Your ${standout.planet} direction is ${local.compass} (${Math.round(local.azimuth)}°)</div>
       <p>${LOCAL_INTERP[standout.planet]}</p>
     </div>`;
-  document.getElementById('simpleResultPanel').style.display = 'block';
 }
 async function generateShareImage(){
-  const standout = findStandoutLine();
+  const standout = await findStandoutLine();
   const meta = PLANET_META[standout.planet];
   const local = computeLocalHighlight(standout.planet);
   const b = ASTRO.basics;
